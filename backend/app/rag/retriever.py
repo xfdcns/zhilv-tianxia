@@ -24,10 +24,15 @@ def _contains_any(text: str, keywords: list[str]) -> bool:
     return any(keyword in text for keyword in keywords)
 
 
-def _score_chunk_for_rerank(query: str, chunk: dict[str, str]) -> int:
+def _score_chunk_for_rerank(
+    query: str,
+    chunk: dict[str, str],
+    destination: str | None = None,
+) -> int:
     """根据 query 关键词对召回片段做轻量打分。"""
     title = chunk.get("title", "")
     text = chunk.get("text", "")
+    source = chunk.get("source", "")
     combined_text = f"{title}\n{text}"
     reasons: list[str] = []
 
@@ -45,18 +50,35 @@ def _score_chunk_for_rerank(query: str, chunk: dict[str, str]) -> int:
         score -= 8
         reasons.append("noise-8:文档开头")
 
-    # 行程类片段更适合承接“景点 / 行程 / 推荐”类请求。
-    if "行程" in title:
+    # 行程类片段更适合承接"景点 / 行程 / 推荐"类请求。
+    if "行程" in title and "行程参考" not in title:
         score += 4
         reasons.append("domain+4:行程标题")
 
-    # 餐饮/预算类片段在“日落/拍照/轻松”这类主目标下通常不是最优候选。
+    # "经典行程参考"类片段内容过于全面，会霸占 Top1，对非行程查询做降权。
+    if "行程参考" in title:
+        score -= 4
+        reasons.append("domain-4:行程参考降权")
+
+    # "目的地简介"内容过于泛化，对具体查询（美食、亲子等）不是最优候选。
+    if "目的地简介" in title:
+        score -= 2
+        reasons.append("domain-2:目的地简介降权")
+
+    # 餐饮/预算类片段在"日落/拍照/轻松"这类主目标下通常不是最优候选。
     if _contains_any(title, ["餐饮", "预算"]) and not _contains_any(
         combined_text,
         ["日落", "傍晚", "拍照", "摄影", "出片", "洱海", "双廊", "慢节奏"],
     ):
         score -= 3
         reasons.append("domain-3:餐饮预算弱相关")
+
+    # 目的地不匹配降权：片段来源与查询目的地不一致时降权。
+    if destination:
+        chunk_lower = f"{source} {title} {text}".lower()
+        if destination.lower() not in chunk_lower:
+            score -= 5
+            reasons.append(f"dest-5:非{destination}片段")
 
     chunk["rerank_reasons"] = reasons
     return score
@@ -66,12 +88,13 @@ def rerank_guide_chunks(
     query: str,
     matched_chunks: list[dict[str, str]],
     top_k: int,
+    destination: str | None = None,
 ) -> list[dict[str, str]]:
     """对召回候选做轻量重排序，并裁剪到最终 top_k。"""
     scored_chunks: list[tuple[int, int, dict[str, str]]] = []
     for index, chunk in enumerate(matched_chunks):
         enriched_chunk = dict(chunk)
-        score = _score_chunk_for_rerank(query, enriched_chunk)
+        score = _score_chunk_for_rerank(query, enriched_chunk, destination=destination)
         enriched_chunk["rerank_score"] = score
         scored_chunks.append((score, -index, enriched_chunk))
 
@@ -79,11 +102,15 @@ def rerank_guide_chunks(
     return [chunk for _, _, chunk in scored_chunks[:top_k]]
 
 
-def retrieve_travel_guide_chunks(query: str, top_k: int = 3) -> list[dict[str, str]]:
+def retrieve_travel_guide_chunks(
+    query: str, top_k: int = 3, destination: str | None = None
+) -> list[dict[str, str]]:
     """返回带轻量 rerank 的原始攻略片段，便于调试和上层复用。"""
     candidate_k = max(top_k * 2, 6)
     matched_chunks = search_guide_chunks(query=query, top_k=candidate_k)
-    return rerank_guide_chunks(query=query, matched_chunks=matched_chunks, top_k=top_k)
+    return rerank_guide_chunks(
+        query=query, matched_chunks=matched_chunks, top_k=top_k, destination=destination
+    )
 
 
 def retrieve_travel_guide(query: str, top_k: int = 3) -> list[str]:
