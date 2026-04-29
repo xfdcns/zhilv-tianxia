@@ -24,10 +24,21 @@ const dietaryOptions = [
   "不吃葱",
 ];
 
+function formatDate(date: Date): string {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, "0");
+  const d = String(date.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
+const today = new Date();
+const todayPlus2 = new Date(today);
+todayPlus2.setDate(todayPlus2.getDate() + 2);
+
 const formState = reactive({
   destination: "大理",
-  startDate: "2026-04-10",
-  endDate: "2026-04-12",
+  startDate: formatDate(today),
+  endDate: formatDate(todayPlus2),
   travelers: 2,
   budget: 3200,
   hotelLevel: "舒适型",
