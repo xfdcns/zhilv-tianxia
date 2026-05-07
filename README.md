@@ -8,6 +8,12 @@
 
 ## 📝 最近更新
 
+- `2026-05-07`
+  - RAG：完成 Cross-encoder Rerank（qwen3-rerank）+ 噪声预过滤，Top1 命中率 86.7%→93.3%，MRR 0.922→0.967。
+  - RAG：新增 Rerank 缓存，缓存命中后 Avg Latency 从 728ms 降至 425ms，降幅 41.6%。
+- `2026-05-06`
+  - RAG：完善评估指标体系，新增 MRR、Noise Rate、Latency、Cross-destination Pollution 四个量化指标。
+  - RAG：完成 LLM-based Query Rewrite，用 qwen-max 替代手写规则改写检索 query，Top1 命中率 80%→86.7%，MRR 0.889→0.922。
 - `2026-04-29`
   - RAG：扩充知识库至 5 个目的地（大理/成都/西安/厦门/三亚），评估样例集扩充至 15 条，完成规则级 Rerank 多层降权与 Query Rewrite 目的地过滤，消除跨目的地污染。
   - 地图前端：新增地图路线虚线箭头可视化、🚩 旗帜打卡标记与景点图片气泡窗口。
@@ -42,11 +48,12 @@
 ## ✨ 项目亮点
 
 - 🧠 **LLM 行程生成**：基于 LangChain + DashScope 调用 `qwen-max` 生成结构化旅行计划
-- 📚 **RAG 攻略增强**：使用本地 Markdown 攻略 + Chroma 向量检索，为生成结果补充目的地上下文
-- 🧭 **RAG 在线优化**：规则级 Query Rewrite（含目的地过滤）+ 多层 Rerank 降权（行程/简介/目的地不匹配），消除跨目的地污染
+- 📚 **RAG 攻略增强**
+  - 本地 Markdown 攻略 + Chroma 向量检索，为生成结果补充目的地上下文
+  - 在线阶段通过 LLM-based Query Rewrite + Cross-encoder Rerank（qwen3-rerank）+ 噪声预过滤持续优化检索质量，Top1 命中率 93.3%，MRR 0.967
 - 🗺️ **高德地图接入**：补充景点地址、经纬度、POI ID、路线距离、耗时和景点图片，并支持虚线箭头路线可视化与 🚩 打卡标记
 - 🌦️ **天气感知提示**：前端展示天气预报，并根据雨天/阴天自动修正旅行提示
-- ⚡ **Redis 缓存层**：覆盖天气、地图与 RAG 检索缓存，减少重复外部调用开销
+- ⚡ **Redis 缓存层**：覆盖天气、地图、RAG 检索与 Rerank 结果缓存，减少重复外部调用开销
 - 💰 **预算拆分**：按交通、住宿、餐饮、门票、其他费用拆分，并支持按天展示
 - 🪄 **智能编辑**：支持用户用自然语言调整某一天行程
 - 🗂️ **历史管理**：支持保存、查看、打开、删除历史 itinerary
@@ -74,90 +81,182 @@
 | 前端 | `frontend/src/views/*.vue` | 规划页、结果页、历史页展示与交互 |
 | 接口层 | `backend/app/api/routes/` | trip、export、weather 路由 |
 | 服务层 | `backend/app/services/` | 行程编排、地图 enrich、天气、缓存、导出、存储 |
-| Agent 层 | `backend/app/agents/` | LLM 行程生成 + RAG Query Rewrite |
-| RAG 层 | `backend/app/rag/` | 向量入库、检索、Rerank |
+| Agent 层 | `backend/app/agents/` | LLM 行程生成 + LLM-based Query Rewrite |
+| RAG 层 | `backend/app/rag/` | 向量入库、检索、Cross-encoder Rerank |
 | 数据层 | `backend/data/` | 本地 Markdown 攻略文档 |
 
 ### 系统数据流
 
 ```mermaid
 flowchart TD
-    Client[前端客户端]
+    Client(("浏览器"))
 
-    subgraph Frontend[Frontend]
-        FrontApp[Vue 页面]
-        FrontApi[api.ts]
+    %% ------- Frontend -------
+    subgraph Frontend["Frontend"]
+        Vue["Vue 页面"]
+        Api["api.ts"]
     end
+    class Frontend frontendBg;
 
-    subgraph Backend[Backend]
-        MainApp[main.py]
+    %% ------- Backend -------
+    subgraph Backend["Backend"]
+        Main["FastAPI main.py"]
 
-        subgraph Routes[Routes]
-            TripRoute[trip.py]
-            ExportRoute[export.py]
-            WeatherRoute[weather.py]
+        subgraph Routes["Routes"]
+            Trip["trip.py"]
+            Export["export.py"]
+            Weather["weather.py"]
         end
 
-        subgraph Services[Services]
-            TripService[trip_service.py]
-            StorageService[storage_service.py]
-            MapService[map_service.py]
-            WeatherService[weather_service.py]
-            ExportService[export_service.py]
+        subgraph Services["Services"]
+            TripSvc["trip_service.py"]
+            MapSvc["map_service.py"]
+            WeatherSvc["weather_service.py"]
+            ExportSvc["export_service.py"]
+            StorageSvc["storage_service.py"]
+            CacheSvc["cache_service.py"]
         end
 
-        subgraph Agent[Agent]
-            PlannerAgent[trip_planner_agent.py]
-            RagTool[rag_tool.py]
+        subgraph Agent["Agent"]
+            Planner["trip_planner_agent.py"]
+            RagTool["rag_tool.py"]
         end
 
-        subgraph RAG[RAG]
-            Retriever[retriever.py]
-            VectorDB[vector_db.py]
-            ChromaDB[(db/chroma_db)]
-            GuideData[(data/*.md)]
+        subgraph RAG["RAG"]
+            Retriever["retriever.py"]
+            VectorDB["vector_db.py"]
+            ChromaDB[("ChromaDB")]
         end
 
-        subgraph Models[Models]
-            Schemas[schemas.py]
-            DBModels[db_models.py]
-        end
-
-        SQLite[(db/app.db)]
+        Schemas["schemas.py"]
+        DBModels["db_models.py"]
+        Redis[("Redis")]
+        SQLite[("SQLite")]
     end
+    class Backend backendBg;
 
-    Client --> FrontApp --> FrontApi --> MainApp
+    %% ------- 主流程（实线） -------
+    Client --> Vue --> Api --> Main
 
-    MainApp --> TripRoute
-    MainApp --> ExportRoute
-    MainApp --> WeatherRoute
+    Main --> Trip
+    Main --> Export
+    Main --> Weather
 
-    TripRoute --> Schemas
-    TripRoute --> TripService
-    WeatherRoute --> WeatherService
-    ExportRoute --> ExportService
+    Trip --> TripSvc
+    Trip --> Schemas
+    Weather --> WeatherSvc
+    Export --> ExportSvc
 
-    TripService --> PlannerAgent
-    TripService --> MapService
-    TripService --> StorageService
-    TripService --> Schemas
+    TripSvc --> Planner
+    TripSvc --> MapSvc
+    TripSvc --> StorageSvc
+    TripSvc --> CacheSvc
 
-    PlannerAgent --> RagTool
-    RagTool --> Retriever --> VectorDB --> ChromaDB
-    GuideData --> VectorDB
+    Planner --> RagTool
+    RagTool --> Retriever
+    Retriever --> VectorDB
+    VectorDB --> ChromaDB
 
-    StorageService --> DBModels --> SQLite
+    CacheSvc --> Redis
+    StorageSvc --> DBModels
+    DBModels --> SQLite
 
-    Schemas --> TripRoute
-    WeatherService --> WeatherRoute
-    ExportService --> ExportRoute
+    %% ------- 返回路径（虚线） -------
+    TripSvc -.-> Api
+    WeatherSvc -.-> Api
+    ExportSvc -.-> Api
 
-    TripRoute --> FrontApi
-    WeatherRoute --> FrontApi
-    ExportRoute --> FrontApi
+    %% ------- Colors -------
+    classDef frontend fill:#eef2ff,stroke:#818cf8,color:#111;
+    classDef backend fill:#fefce8,stroke:#facc15,color:#111;
+    classDef routes fill:#f0fdfa,stroke:#2dd4bf,color:#111;
+    classDef services fill:#f5f3ff,stroke:#a78bfa,color:#111;
+    classDef agent fill:#fff1f2,stroke:#fb7185,color:#111;
+    classDef rag fill:#ecfeff,stroke:#22d3ee,color:#111;
+    classDef data fill:#f0fdf4,stroke:#4ade80,color:#111;
+    classDef storage fill:#fff7ed,stroke:#fb923c,color:#111;
+
+    %% 背景框颜色（Frontend、Backend）
+    classDef frontendBg fill:#eef2ff,stroke:#818cf8,stroke-width:2px,color:#111;
+    classDef backendBg fill:#fffbea,stroke:#facc15,stroke-width:2px,color:#111;
+
+    %% ------- Assign Colors -------
+    class Client,Vue,Api frontend;
+    class Main backend;
+    class Trip,Export,Weather routes;
+    class TripSvc,MapSvc,WeatherSvc,ExportSvc,StorageSvc,CacheSvc services;
+    class Planner,RagTool agent;
+    class Retriever,VectorDB,ChromaDB rag;
+    class Schemas,DBModels data;
+    class Redis,SQLite storage;
 ```
 
 数据流路径：前端收集用户输入 → 后端调用 LLM + RAG 生成结构化行程 → 地图服务补充地址、坐标、路线和图片 → 前端展示地图、天气、预算和每日行程 → 用户可保存、编辑、查看历史并导出文档。
+
+### RAG 检索流程
+
+```mermaid
+%%{init: {"layout": "elk"}}%%
+flowchart TD
+    %% ------- Offline -------
+    subgraph Offline
+        Guides[("data 攻略文档")]
+        Ingest["ingest_data.py"]
+        Embed["text-embedding-v4"]
+        DB[("ChromaDB")]
+
+        Guides --> Ingest
+        Ingest --> Embed
+        Embed --> DB
+    end
+
+    %% ------- Online -------
+    subgraph Online
+        Input("用户输入 目的地 偏好 节奏 备注")
+        QR{"Query Rewrite"}
+        LLM_QR["LLM-based qwen-max"]
+        Rule_QR["规则级 fallback"]
+        Cache{"RAG 缓存命中?"}
+        Vector["ChromaDB 向量召回"]
+        Noise["噪声预过滤"]
+        Rerank{"Cross-encoder Rerank"}
+        DS["qwen3-rerank"]
+        Rule_RR["规则级 fallback"]
+        SetCache["写入 Redis 缓存"]
+        Output("返回 top-k 片段给 LLM")
+
+        Input --> QR
+        QR -->|优先| LLM_QR
+        QR -->|fallback| Rule_QR
+        LLM_QR --> Cache
+        Rule_QR --> Cache
+        Cache -->|命中| Output
+        Cache -->|未命中| Vector
+        Vector --> Noise
+        Noise --> Rerank
+        Rerank -->|优先| DS
+        Rerank -->|fallback| Rule_RR
+        DS --> SetCache
+        Rule_RR --> SetCache
+        SetCache --> Output
+    end
+
+    DB --> Vector
+
+    %% ------- Color definitions -------
+    classDef offline fill:#fefce8,stroke:#facc15;
+    classDef online_input fill:#eef2ff,stroke:#818cf8;
+    classDef online_logic fill:#f0fdfa,stroke:#2dd4bf;
+    classDef retrieve fill:#fdf4ff,stroke:#e879f9;
+    classDef rerank fill:#fff1f2,stroke:#fb7185;
+    classDef output fill:#f0fdf4,stroke:#4ade80;
+
+    class Guides,Ingest,Embed,DB offline;
+    class Input online_input;
+    class QR,LLM_QR,Rule_QR,Cache,Vector,Noise online_logic;
+    class Rerank,DS,Rule_RR rerank;
+    class SetCache,Output output;
+```
 
 ---
 
@@ -171,7 +270,7 @@ TripPlannerDemo/
 │   │   ├── agents/
 │   │   │   ├── trip_planner_agent.py    # LLM 行程生成与单日编辑逻辑
 │   │   │   └── tools/
-│   │   │       └── rag_tool.py          # Query Rewrite：把用户需求改写成更适合检索的 query
+│   │   │       └── rag_tool.py          # Query Rewrite：LLM-based 改写 + 规则级 fallback
 │   │   ├── api/
 │   │   │   ├── main.py                  # FastAPI 应用入口
 │   │   │   └── routes/
@@ -183,7 +282,7 @@ TripPlannerDemo/
 │   │   │   └── db_models.py             # SQLAlchemy 数据库表定义
 │   │   ├── rag/
 │   │   │   ├── vector_db.py             # Markdown 切片、Chroma 入库与检索
-│   │   │   └── retriever.py             # 检索封装、RAG 缓存与轻量 Rerank
+│   │   │   └── retriever.py             # 检索封装、RAG 缓存、Cross-encoder Rerank + 规则级 fallback
 │   │   └── services/
 │   │       ├── trip_service.py          # 行程主编排逻辑、预算计算、地图 enrich
 │   │       ├── cache_service.py         # Redis 缓存封装与降级逻辑
@@ -231,9 +330,9 @@ TripPlannerDemo/
 - `backend/app/agents/trip_planner_agent.py`
   负责调用大模型生成结构化旅行草稿，并处理单日编辑时的 LLM 输出。
 - `backend/app/agents/tools/rag_tool.py`
-  负责 RAG 在线阶段的 Query Rewrite，把目的地、偏好、节奏与备注整理成更适合检索的 query。
+  负责 RAG 在线阶段的 Query Rewrite，优先使用 LLM-based 改写（qwen-max），失败时 fallback 到规则级关键词提取。
 - `backend/app/rag/retriever.py`
-  负责基础向量召回后的结果封装、Redis 缓存以及轻量 Rerank，把更贴近旅行规划目标的片段排到前面。
+  负责基础向量召回后的结果封装、Redis 缓存以及 Cross-encoder Rerank（qwen3-rerank），优先语义级重排序，失败时 fallback 到规则级打分。
 - `backend/app/services/map_service.py`
   负责对接高德地图 Web 服务，并结合 Redis 缓存补充地址、经纬度、路线估算和景点图片。
 - `backend/app/services/export_service.py`
@@ -247,7 +346,7 @@ TripPlannerDemo/
 - `backend/scripts/debug_rag_retrieval.py`
   负责调试 RAG 在线阶段，输出检索 query、top-k 召回片段、`rerank_score` 与 `rerank_reasons`。
 - `backend/scripts/evaluate_rag_retrieval.py`
-  负责基于小型样例集评估 RAG 检索效果，输出 Top1 命中、TopK 命中、关键词覆盖与噪声片段数量。
+  负责基于小型样例集评估 RAG 检索效果，输出 Top1/TopK 命中率、MRR、关键词覆盖、Noise Rate、Latency 与跨目的地污染指标。
 - `backend/eval/rag_eval_cases.json`
   记录旅行场景下的 RAG 检索评估样例，用于对比后续检索优化前后的效果变化。
 
@@ -480,9 +579,9 @@ cd frontend
 
 - ✅ **后端能力**：行程生成、智能编辑、保存查询、历史列表、删除、天气查询、Markdown 导出与 PDF 导出接口
 - ✅ **AI 与数据能力**：LangChain 行程生成链路、5 个目的地攻略 RAG 检索、Chroma 入库检索、高德地图地址/坐标/路线/图片补充
-- ✅ **RAG 在线优化**：规则级 Query Rewrite（含目的地过滤）、多层 Rerank 降权、检索调试脚本与 15 条评估样例集
+- ✅ **RAG 在线优化**：LLM-based Query Rewrite + Cross-encoder Rerank（qwen3-rerank）+ 噪声预过滤 + Rerank 缓存、检索调试脚本与 15 条评估样例集、量化评估指标体系（Top1/TopK Hit Rate、MRR、Noise Rate、Latency、Cross-destination Pollution）
 - ✅ **前端能力**：规划页、结果页、历史列表页，以及地图/天气/预算展示、导出与历史管理主流程
-- ✅ **缓存与持久化**：SQLite 持久化存储 + Redis 缓存层（覆盖天气、地图与 RAG 检索）
+- ✅ **缓存与持久化**：SQLite 持久化存储 + Redis 缓存层（覆盖天气、地图、RAG 检索与 Rerank 结果）
 - ✅ **验证情况**：核心链路稳定跑通，Redis 缓存 key 可在本地容器中验证写入
 
 ---
@@ -493,12 +592,12 @@ cd frontend
   已完成 Redis 基础缓存层，当前已覆盖天气查询、地图查询与 RAG 检索结果缓存；后续可以继续扩展到会话态管理、热点目的地复用、异步任务状态保存与更细粒度的缓存命中统计。
 - 🚧 **实时信息增强**
   可接入联网搜索能力，补充景点营业状态、近期热门地点、节假日信息与实时出行建议，让本地攻略 RAG 与实时信息形成互补。
-- 🚧 **RAG 检索增强**
-  - ✅ 已完成第一轮在线阶段优化，接入轻量化 Query Rewrite、轻量 Rerank 与检索调试脚本。
+- ✅ **RAG 检索增强（已完成核心优化）**
+  - ✅ 已完成第一轮在线阶段优化，接入轻量化 Query Rewrite(规则级)、轻量 Rerank(规则级) 与检索调试脚本。
   - ✅ 已完成 RAG 知识库扩充至 5 个目的地，评估样例集扩充至 15 条。
   - ✅ 已完成规则级 Rerank 多层降权（行程降权、简介降权、目的地不匹配降权）与 Query Rewrite 目的地过滤，消除跨目的地污染。
-  - 🚧 后续引入 LLM-based Query Rewrite（用 qwen-max 改写检索 query，替代手写规则）。
-  - 🚧 后续引入 Cross-encoder Rerank（用 bge-reranker-base 等模型做语义相关性打分，替代关键词规则）。
+  - ✅ 已完成 LLM-based Query Rewrite（用 qwen-max 改写检索 query，替代手写规则），Top1 命中率 80%→86.7%，MRR 0.889→0.922。
+  - ✅ 已完成 Cross-encoder Rerank（qwen3-rerank）+ 噪声预过滤 + instruct 引导，Top1 命中率 86.7%→93.3%，MRR 0.922→0.967。
   - 🚧 后续继续推进检索结果压缩、去冗与混合检索，减少冗余上下文和弱相关片段干扰。
   - 🚧 更高阶方向可尝试 GraphRAG，用图结构表达城市、景点、路线与主题标签之间的关系，增强多地点联动推荐和行程合理性约束。
 - 🚧 **Agent 与工作流编排**

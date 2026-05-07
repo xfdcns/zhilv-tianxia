@@ -1,4 +1,16 @@
+import logging
+
+from app.config import (
+    LLM_API_KEY,
+    LLM_BASE_URL,
+    LLM_MAX_RETRIES,
+    LLM_MODEL,
+    LLM_TIMEOUT_SECONDS,
+)
 from app.rag.retriever import retrieve_travel_guide
+
+
+logger = logging.getLogger(__name__)
 
 
 # rag_tool.py 自己不直接检索，
@@ -48,13 +60,82 @@ def _extract_note_keywords(special_notes: str | None, destination: str | None = 
     return keywords
 
 
-def build_destination_query(
+def _build_chat_llm():
+    """创建 ChatOpenAI 实例，用于 Query Rewrite。"""
+    if not LLM_API_KEY:
+        return None
+    try:
+        from langchain_openai import ChatOpenAI
+    except ImportError:
+        return None
+    return ChatOpenAI(
+        model=LLM_MODEL,
+        temperature=0.2,
+        api_key=LLM_API_KEY,
+        base_url=LLM_BASE_URL or None,
+        timeout=LLM_TIMEOUT_SECONDS,
+        max_retries=LLM_MAX_RETRIES,
+    )
+
+
+def llm_rewrite_query(
+    destination: str,
+    preferences: list[str] | None = None,
+    pace: str | None = None,
+    special_notes: str | None = None,
+) -> str | None:
+    """用 LLM 把用户旅行需求改写成适合向量检索的 query。失败返回 None。"""
+    llm = _build_chat_llm()
+    if llm is None:
+        return None
+
+    system_prompt = (
+        "你是一个 RAG 检索 query 改写专家。"
+        "你的任务是把用户的旅行需求改写成适合向量检索的关键词组合。"
+        "输出要求："
+        "1. 只输出检索关键词，用空格分隔"
+        "2. 不要输出解释、标点或任何多余文字"
+        "3. 关键词要具体，优先包含景点名称、活动类型、场景特征"
+        "4. 包含目的地城市名"
+    )
+
+    parts = [f"目的地：{destination}"]
+    if preferences:
+        parts.append(f"偏好：{'、'.join(preferences)}")
+    if pace:
+        parts.append(f"节奏：{pace}")
+    if special_notes:
+        parts.append(f"备注：{special_notes}")
+    human_prompt = "\n".join(parts)
+
+    try:
+        response = llm.invoke([
+            ("system", system_prompt),
+            ("human", human_prompt),
+        ])
+        raw_text = getattr(response, "content", "")
+        if isinstance(raw_text, list):
+            raw_text = "".join(
+                item.get("text", "") if isinstance(item, dict) else str(item)
+                for item in raw_text
+            )
+        query = raw_text.strip()
+        if query:
+            logger.info("llm_rewrite_query: input=%s -> output=%s", human_prompt, query)
+            return query
+    except Exception:
+        logger.warning("llm_rewrite_query failed, falling back to rule-based", exc_info=True)
+
+    return None
+
+
+def _rule_based_query(
     destination: str,
     preferences: list[str] | None = None,
     pace: str | None = None,
     special_notes: str | None = None,
 ) -> str:
-    """把目的地、偏好、节奏和备注改写成更贴近检索场景的 query。"""
+    """规则级 Query Rewrite，作为 LLM Rewrite 的 fallback。"""
     parts: list[str] = [destination]
 
     if preferences:
@@ -67,11 +148,35 @@ def build_destination_query(
     for keyword in _extract_note_keywords(special_notes, destination=destination):
         _append_unique(parts, keyword)
 
-    # 为向量检索补一些更稳定的旅游语义词，帮助召回景点、行程、攻略等片段。
     for stable_term in ["景点", "行程", "攻略", "推荐"]:
         _append_unique(parts, stable_term)
 
     return " ".join(part for part in parts if part).strip()
+
+
+def build_destination_query(
+    destination: str,
+    preferences: list[str] | None = None,
+    pace: str | None = None,
+    special_notes: str | None = None,
+) -> str:
+    """把目的地、偏好、节奏和备注改写成更贴近检索场景的 query。优先 LLM，fallback 规则级。"""
+    llm_query = llm_rewrite_query(
+        destination=destination,
+        preferences=preferences,
+        pace=pace,
+        special_notes=special_notes,
+    )
+    if llm_query:
+        return llm_query
+
+    logger.info("build_destination_query: LLM rewrite unavailable, using rule-based")
+    return _rule_based_query(
+        destination=destination,
+        preferences=preferences,
+        pace=pace,
+        special_notes=special_notes,
+    )
 
 
 def _build_destination_query(

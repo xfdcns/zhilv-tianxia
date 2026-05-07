@@ -1,9 +1,16 @@
+import hashlib
+import json
 import logging
 import re
 
-from app.config import REDIS_RAG_TTL_SECONDS
+import httpx
+
+from app.config import LLM_API_KEY, REDIS_RAG_TTL_SECONDS, REDIS_RERANK_TTL_SECONDS, RERANK_MODEL
 from app.rag.vector_db import search_guide_chunks
 from app.services.cache_service import get_cached_json, set_cached_json
+
+
+DASHSCOPE_RERANK_URL = "https://dashscope.aliyuncs.com/compatible-api/v1/reranks"
 
 
 logger = logging.getLogger(__name__)
@@ -84,13 +91,151 @@ def _score_chunk_for_rerank(
     return score
 
 
+_NOISE_TITLES = {"文档开头"}
+
+
+def _rerank_with_dashscope(
+    query: str,
+    chunks: list[dict[str, str]],
+    top_k: int,
+) -> list[tuple[float, int]] | None:
+    """调用 DashScope qwen3-rerank 模型做语义重排序。失败返回 None。"""
+    if not LLM_API_KEY or not chunks:
+        return None
+
+    # 过滤已知噪声片段，避免浪费 rerank 名额
+    filtered = [
+        (i, chunk) for i, chunk in enumerate(chunks)
+        if chunk.get("title", "") not in _NOISE_TITLES
+    ]
+    if not filtered:
+        return None
+
+    original_indices = [i for i, _ in filtered]
+    clean_chunks = [chunk for _, chunk in filtered]
+
+    documents = [
+        f"{chunk.get('title', '')}\n{chunk.get('text', '')}"
+        for chunk in clean_chunks
+    ]
+
+    payload = {
+        "model": RERANK_MODEL,
+        "documents": documents,
+        "query": query,
+        "top_n": min(top_k, len(documents)),
+        "instruct": (
+            "你是一个旅行攻略检索专家。"
+            "给定一个旅行规划查询，从候选文档中检索出最具体、最详细、最能直接回答用户问题的片段。"
+            "优先选择包含具体景点名称、活动推荐、实用信息的片段，"
+            "避免选择泛化的目的地简介、文档开头等信息量低的片段。"
+        ),
+    }
+
+    try:
+        with httpx.Client(timeout=30) as client:
+            response = client.post(
+                DASHSCOPE_RERANK_URL,
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {LLM_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+            )
+            if response.status_code != 200:
+                logger.warning(
+                    "dashscope rerank HTTP %d: %s",
+                    response.status_code,
+                    response.text[:500],
+                )
+                return None
+            data = response.json()
+
+        # 兼容两种响应格式
+        results = data.get("output", {}).get("results", []) or data.get("results", [])
+        if not results:
+            logger.warning("dashscope rerank empty results, response: %s", json.dumps(data, ensure_ascii=False)[:500])
+            return None
+
+        scored = [
+            (float(item.get("relevance_score", 0)), original_indices[int(item.get("index", 0))])
+            for item in results
+            if int(item.get("index", 0)) < len(original_indices)
+        ]
+        scored.sort(key=lambda x: x[0], reverse=True)
+        logger.info("dashscope rerank: query=%s, results=%d", query, len(scored))
+        return scored
+
+    except Exception as exc:
+        logger.warning("dashscope rerank failed: %s, falling back to rule-based", exc)
+        return None
+
+
+def _build_rerank_cache_key(query: str, chunks: list[dict[str, str]]) -> str:
+    """根据 query 和 chunk 内容生成 rerank 缓存 key。"""
+    """
+query = " 大理 自然风景 "，_normalize_cache_text 处理后得到 "大理 自然风景"。
+
+chunks = [{"source": "大理攻略.md", "title": "苍山"}, {"source": "大理攻略.md", "title": "洱海"}]
+
+content_fingerprint = "大理攻略.md:苍山|大理攻略.md:洱海"
+
+chunks_hash = hashlib.md5("大理攻略.md:苍山|大理攻略.md:洱海".encode()).hexdigest()[:12] → 假设得到 "a1b2c3d4e5f6"
+
+最终缓存键："rerank:大理 自然风景:a1b2c3d4e5f6"
+    """
+    normalized_query = _normalize_cache_text(query)
+    content_fingerprint = "|".join(
+        f"{c.get('source', '')}:{c.get('title', '')}" for c in chunks
+    )
+    chunks_hash = hashlib.md5(content_fingerprint.encode()).hexdigest()[:12]
+    return f"rerank:{normalized_query}:{chunks_hash}"
+
+
 def rerank_guide_chunks(
     query: str,
     matched_chunks: list[dict[str, str]],
     top_k: int,
     destination: str | None = None,
 ) -> list[dict[str, str]]:
-    """对召回候选做轻量重排序，并裁剪到最终 top_k。"""
+    """对召回候选做重排序，优先 Cross-encoder，fallback 规则级。"""
+    # 尝试从缓存读取 rerank 结果
+    cache_key = _build_rerank_cache_key(query, matched_chunks)
+    cached = get_cached_json(cache_key)
+    if cached is not None:
+        logger.info("rerank cache hit: query=%s", query)
+        reranked: list[dict[str, str]] = []
+        for item in cached:
+            idx = item["i"]
+            if 0 <= idx < len(matched_chunks):
+                enriched = dict(matched_chunks[idx])
+                enriched["rerank_score"] = item["s"]
+                enriched["rerank_reasons"] = [f"cross-encoder:{item['s']:.4f}"]
+                reranked.append(enriched)
+        return reranked[:top_k]
+    logger.info("rerank cache miss: query=%s", query)
+
+    # 优先尝试 DashScope Cross-encoder Rerank
+    dashscope_results = _rerank_with_dashscope(query, matched_chunks, top_k)
+    if dashscope_results:
+        # 写入缓存：只存索引和分数，不重复存文本
+        cache_value = [
+            {"i": idx, "s": round(score, 4)}
+            for score, idx in dashscope_results
+        ]
+        set_cached_json(cache_key, cache_value, expire_seconds=REDIS_RERANK_TTL_SECONDS)
+
+        reranked = []
+        for score, original_index in dashscope_results:
+            if 0 <= original_index < len(matched_chunks):
+                enriched_chunk = dict(matched_chunks[original_index])
+                enriched_chunk["rerank_score"] = round(score, 4)
+                enriched_chunk["rerank_reasons"] = [f"cross-encoder:{score:.4f}"]
+                reranked.append(enriched_chunk)
+        return reranked[:top_k]
+
+    # fallback 到规则级 Rerank
+    logger.info("rerank_guide_chunks: using rule-based rerank")
     scored_chunks: list[tuple[int, int, dict[str, str]]] = []
     for index, chunk in enumerate(matched_chunks):
         enriched_chunk = dict(chunk)

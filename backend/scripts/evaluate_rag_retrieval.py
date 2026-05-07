@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from pathlib import Path
 import sys
 from typing import Any
@@ -17,6 +18,8 @@ from app.rag.retriever import retrieve_travel_guide_chunks
 
 
 DEFAULT_CASES_PATH = BACKEND_DIR / "eval" / "rag_eval_cases.json"
+
+ALL_DESTINATIONS = ["大理", "成都", "西安", "厦门", "三亚"]
 
 
 def _load_cases(path: Path) -> list[dict[str, Any]]:
@@ -44,7 +47,10 @@ def _evaluate_case(case: dict[str, Any]) -> dict[str, Any]:
         pace=case.get("pace"),
         special_notes=case.get("special_notes"),
     )
+
+    start_time = time.perf_counter()
     chunks = retrieve_travel_guide_chunks(query=query, top_k=top_k, destination=destination)
+    latency_ms = round((time.perf_counter() - start_time) * 1000, 1)
 
     expected_title_keywords = list(case.get("expected_title_keywords", []))
     required_content_keywords = list(case.get("required_content_keywords", []))
@@ -63,8 +69,26 @@ def _evaluate_case(case: dict[str, Any]) -> dict[str, Any]:
         1 for title in titles if _contains_any(title, noise_title_keywords)
     )
 
+    # MRR: 第一个命中期望关键词的结果排名的倒数
+    reciprocal_rank = 0.0
+    for rank, title in enumerate(titles, start=1):
+        if _contains_any(title, expected_title_keywords):
+            reciprocal_rank = 1.0 / rank
+            break
+
+    # 跨目的地污染：片段来源包含非当前目的地的城市名
+    other_destinations = [d for d in ALL_DESTINATIONS if d not in destination]
+    pollution_count = 0
+    for chunk in chunks:
+        source = str(chunk.get("source", ""))
+        title = str(chunk.get("title", ""))
+        chunk_text = f"{source} {title}"
+        if any(other in chunk_text for other in other_destinations):
+            pollution_count += 1
+
     return {
         "id": case.get("id", "<unknown>"),
+        "destination": destination,
         "query": query,
         "top1_title": top1_title,
         "top1_title_hit": top1_title_hit,
@@ -72,12 +96,16 @@ def _evaluate_case(case: dict[str, Any]) -> dict[str, Any]:
         "required_keyword_hits": required_keyword_hits,
         "required_keyword_total": len(required_content_keywords),
         "noise_count": noise_count,
+        "reciprocal_rank": reciprocal_rank,
+        "pollution_count": pollution_count,
+        "latency_ms": latency_ms,
         "titles": titles,
     }
 
 
 def _print_case_result(result: dict[str, Any]) -> None:
     print(f"case: {result['id']}")
+    print(f"destination: {result['destination']}")
     print(f"query: {result['query']}")
     print(f"top1_title: {result['top1_title']}")
     print(f"top1_title_hit: {result['top1_title_hit']}")
@@ -87,6 +115,9 @@ def _print_case_result(result: dict[str, Any]) -> None:
         f"{result['required_keyword_hits']}/{result['required_keyword_total']}"
     )
     print(f"noise_count: {result['noise_count']}")
+    print(f"reciprocal_rank: {result['reciprocal_rank']:.3f}")
+    print(f"pollution_count: {result['pollution_count']}")
+    print(f"latency_ms: {result['latency_ms']}")
     print("titles:")
     for index, title in enumerate(result["titles"], start=1):
         print(f"  {index}. {title}")
@@ -122,13 +153,21 @@ def main() -> int:
     total_required_keywords = sum(
         int(result["required_keyword_total"]) for result in results
     )
+    mrr = sum(result["reciprocal_rank"] for result in results) / total
+    noise_rate = total_noise / (total * int(cases[0].get("top_k", 5))) * 100
+    total_pollution = sum(int(result["pollution_count"]) for result in results)
+    avg_latency = sum(result["latency_ms"] for result in results) / total
 
     print("=== Summary ===")
     print(f"cases: {total}")
-    print(f"top1_title_hit_rate: {top1_hits}/{total}")
-    print(f"topk_title_hit_rate: {topk_hits}/{total}")
+    print(f"top1_title_hit_rate: {top1_hits}/{total} ({top1_hits/total*100:.1f}%)")
+    print(f"topk_title_hit_rate: {topk_hits}/{total} ({topk_hits/total*100:.1f}%)")
     print(f"required_keyword_coverage: {total_required_hits}/{total_required_keywords}")
+    print(f"MRR: {mrr:.3f}")
     print(f"noise_count_total: {total_noise}")
+    print(f"noise_rate: {noise_rate:.1f}%")
+    print(f"cross_destination_pollution: {total_pollution}")
+    print(f"avg_latency_ms: {avg_latency:.1f}")
     return 0
 
 
