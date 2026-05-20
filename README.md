@@ -281,6 +281,42 @@ flowchart TD
     class SetCache,Output output;
 ```
 
+**离线阶段**
+
+```text
+本地 Markdown 攻略 → 按标题切块（49 个片段） → text-embedding-v4 转向量 → 写入 ChromaDB
+```
+
+这一步只做一次，数据入库后就不再动了。
+
+**在线阶段**
+
+```text
+用户输入（目的地 / 偏好 / 节奏 / 备注）
+    ↓
+① Query Rewrite（LLM-based / 规则 fallback）
+    输出：检索关键词，如"大理 美食 拍照 古城 洱海"
+    ↓
+② Embedding（同一个 text-embedding-v4）
+    把检索关键词转向量，才能和 ChromaDB 里的文档向量做相似度计算
+    ↓
+③ 向量召回（ChromaDB）
+    用向量相似度找到 top-6 候选片段
+    ↓
+④ 噪声预过滤
+    去掉"文档开头"等低信息量片段，避免浪费 rerank 的 API 调用
+    ↓
+⑤ Cross-encoder Rerank（qwen3-rerank / 规则 fallback）
+    语义级重排序，选出 top-3 最相关片段
+    ↓
+⑥ 写入 Redis 缓存
+    RAG 缓存：query → top-k 文本
+    Rerank 缓存：query + 候选哈希 → 排序分数
+    ↓
+⑦ 返回 top-k 文本给 LLM
+    和用户信息一起组装成 prompt，调 qwen-max 生成行程
+```
+
 ---
 
 ## 📁 项目结构
